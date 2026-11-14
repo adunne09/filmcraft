@@ -13,7 +13,7 @@
 //! `file.exportOmf {path, sequence?, audio?: "embedded"|"separate", audioFormat?, sampleRate?,
 //! bitDepth?, trimAudio? (default on), handles?, renderAudioEffects?, breakoutToMono?}`
 //!
-//! `file.importAaf {path}` (also `file.import` of `.aaf` / `.omf` files).
+//! `file.importAaf {path, bin?}` (also `file.import` of `.aaf` / `.omf` files).
 
 use std::sync::{Arc, Mutex};
 
@@ -74,10 +74,20 @@ fn plan_from(s: &Session, p: &Value, seq: ItemId, cmd: &str, omf: bool) -> Resul
     if !(8_000..=192_000).contains(&sample_rate) {
         return Err(bad(cmd, "sampleRate must be 8000–192000"));
     }
-    let bits = u64_p(p, "bitDepth").unwrap_or(16) as u16;
-    if bits != 16 && bits != 24 {
-        return Err(bad(cmd, "bitDepth must be 16 or 24"));
-    }
+    // A number, or the string the params list it as ("16|24"); anything else is refused rather
+    // than read as 16 (#4019).
+    let bits: u16 = match p.get("bitDepth").filter(|v| !v.is_null()) {
+        None => 16,
+        Some(v) => match v
+            .as_u64()
+            .or_else(|| v.as_f64().filter(|f| f.fract() == 0.0 && *f >= 0.0).map(|f| f as u64))
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+        {
+            Some(16) => 16,
+            Some(24) => 24,
+            _ => return Err(bad(cmd, format!("bitDepth must be 16 or 24, not {v}"))),
+        },
+    };
     let frames = u64_p(p, "handles").unwrap_or(if omf { 30 } else { 0 }) as i64;
     Ok(AudioPlan {
         mode,
@@ -130,6 +140,9 @@ fn dequantize(pcm: &[u8], channels: usize, bits: u16) -> Vec<Vec<f32>> {
     out
 }
 
+const MAX_EXPORT_AUDIO_CHANNELS: usize = 64;
+const MAX_EXPORT_AUDIO_SAMPLES: usize = 64 * 1024 * 1024;
+
 /// Decode a media range at `sample_rate` (planar).
 fn decode(s: &Session, need: &AudioNeed, sample_rate: u32) -> Result<Vec<Vec<f32>>> {
     let src = s
@@ -138,12 +151,17 @@ fn decode(s: &Session, need: &AudioNeed, sample_rate: u32) -> Result<Vec<Vec<f32
         .ok_or_else(|| EngineError::Other(format!("media {} is offline", need.path.as_deref().unwrap_or("?"))))?;
     let start = need.start.to_units_floor(sample_rate as i64);
     let frames = (need.end.to_units_floor(sample_rate as i64) - start).max(0) as usize;
-    let mut out: Vec<Vec<f32>> = vec![Vec::with_capacity(frames); need.channels.max(1) as usize];
+    let ch = (need.channels.max(1) as usize).min(MAX_EXPORT_AUDIO_CHANNELS);
+    let total_samples = ch.checked_mul(frames).ok_or_else(|| EngineError::Other("audio export buffer size overflow".into()))?;
+    if total_samples > MAX_EXPORT_AUDIO_SAMPLES {
+        return Err(EngineError::Other(format!("audio export buffer size {total_samples} samples exceeds maximum allowed ({MAX_EXPORT_AUDIO_SAMPLES})")));
+    }
+    let mut out: Vec<Vec<f32>> = vec![Vec::with_capacity(frames); ch];
     let chunk = sample_rate as usize * 10;
     let mut done = 0usize;
     while done < frames {
         let n = chunk.min(frames - done);
-        let b = src.audio(start + done as i64, n, sample_rate).map_err(|e| EngineError::Other(e.to_string()))?;
+        let b = src.audio_stream(need.audio_stream, start + done as i64, n, sample_rate).map_err(|e| EngineError::Other(e.to_string()))?;
         for (c, o) in out.iter_mut().enumerate() {
             match b.channels.get(c).or(b.channels.first()) {
                 Some(x) => o.extend(x.iter().copied().chain(std::iter::repeat(0.0)).take(n)),
@@ -230,8 +248,19 @@ fn ensure_dir(s: &Session, dir: &str) {
     }
 }
 
+fn check_linked_streams(s: &Session, seq: ItemId, plan: &AudioPlan) -> Result<()> {
+    if plan.mode == AudioMode::Linked && !plan.trim && !plan.render_effects {
+        let needs = audio_needs(&s.project, seq, &NeedOptions { nests: plan.nests, ..Default::default() });
+        if needs.iter().any(|need| need.audio_stream > 0) {
+            return Err(EngineError::Other("linked AAF media cannot select container audio streams; choose embedded or separate audio".into()));
+        }
+    }
+    Ok(())
+}
+
 /// Prepare the audio essence of an export; returns the essence and the files written.
 pub fn prepare_audio(s: &Session, seq: ItemId, plan: &AudioPlan, media_dir: &str) -> Result<(Vec<AudioEssence>, Vec<String>)> {
+    check_linked_streams(s, seq, plan)?;
     if plan.mode == AudioMode::Linked && !plan.trim && !plan.render_effects {
         return Ok((Vec::new(), Vec::new()));
     }
@@ -255,7 +284,7 @@ pub fn prepare_audio(s: &Session, seq: ItemId, plan: &AudioPlan, media_dir: &str
                 let name = audio_clip(&s.project, seq, c).map(|(_, _, ti)| ti.name.clone()).unwrap_or_default();
                 format!("{} {}", safe_name(&name), c.0)
             }
-            EssenceKey::Media(_) => safe_name(
+            EssenceKey::Media(_) | EssenceKey::MediaStream { .. } => safe_name(
                 need.path
                     .as_deref()
                     .map(|p| std::path::Path::new(p).file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default())
@@ -293,15 +322,16 @@ pub fn prepare_audio(s: &Session, seq: ItemId, plan: &AudioPlan, media_dir: &str
                             .chunks_exact(bps)
                             .map(|b| if bps == 3 { i32::from_le_bytes([0, b[0], b[1], b[2]]) >> 8 } else { i16::from_le_bytes([b[0], b[1]]) as i32 })
                             .collect();
-                        let opts = filmcraft_mxf::OpAtomPcm {
+                        let opts = craft_media::mxf::OpAtomPcm {
                             sample_rate: plan.sample_rate,
                             bits: plan.bits as u32,
                             channels: n,
                             edit_rate: None,
-                            ids: filmcraft_mxf::PackageIds::from_seed(&path, &name),
+                            ids: craft_media::mxf::PackageIds::from_seed(&path, &name),
                             timecode: None,
                         };
-                        filmcraft_mxf::write_opatom_pcm(&opts, &samples).map_err(|e| EngineError::Other(format!("{path}: {e}")))?
+                        craft_media::mxf::write_opatom_pcm_as(&opts, &samples, "FilmCraft", "FilmCraft", env!("CARGO_PKG_VERSION"))
+                            .map_err(|e| EngineError::Other(format!("{path}: {e}")))?
                     } else if plan.aiff {
                         filmcraft_interchange::wav::aiff_file(&pcm, n as u16, plan.sample_rate, plan.bits)
                     } else {
@@ -380,6 +410,7 @@ pub fn export_aaf(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_p(p, "path").ok_or_else(|| bad(cmd, "need `path`"))?.to_string();
     let seq = crate::export_tools::sequence_param(s, p, cmd)?;
     let plan = plan_from(s, p, seq, cmd, false)?;
+    check_linked_streams(s, seq, &plan)?;
     let (dir, stem) = split(&path);
     let media_dir = join(&dir, &format!("{stem} Media"));
     let mut files = Vec::new();
@@ -436,5 +467,6 @@ pub fn import_document(s: &mut Session, p: &Value, cmd: &str) -> Result<Value> {
     let bytes = s.services.read_file(&path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     let format = crate::interchange::detect(&path, &bytes).filter(|f| matches!(f, filmcraft_interchange::Format::Aaf | filmcraft_interchange::Format::Omf));
     let format = format.ok_or_else(|| bad(cmd, format!("{path} is not an AAF or OMF file")))?;
-    crate::interchange::import(s, &path, &bytes, format)
+    let bin = u64_p(p, "bin").map(filmcraft_project::BinId);
+    crate::interchange::import(s, &path, &bytes, format, bin)
 }

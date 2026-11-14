@@ -45,7 +45,18 @@ pub trait VideoDecoder: Send {
     /// shortcuts that only change pictures nothing references, which come out flagged
     /// [`DecodedFrame::draft`]. Decoders without such a mode ignore it.
     fn set_draft(&mut self, _on: bool) {}
+    /// Made with fewer worker threads than a decoder for playback gets, because it was made for
+    /// background work ([`filmcraft_media::cancel::with_background`]). A request for a monitor
+    /// replaces such a decoder.
+    fn thread_limited(&self) -> bool {
+        false
+    }
 }
+
+/// Worker threads of the H.264 decoders made for background work (thumbnails): a frame-threaded
+/// 4K decoder holds `threads + 2` pictures in flight (~0.5 GB with 16 threads), and the frame
+/// workers already decode different files in parallel.
+const BACKGROUND_H264_THREADS: usize = 2;
 
 /// NAL unit headers of a length-prefixed (avcC / hvcC) sample: the first two bytes of each unit.
 fn nal_headers(sample: &[u8], length_size: usize) -> impl Iterator<Item = (u8, u8)> + '_ {
@@ -129,11 +140,14 @@ pub(crate) fn tight_plane<T: Copy>(src: Vec<T>, stride: usize, w: usize, h: usiz
 }
 
 /// Colour of an H.264 / HEVC picture from its VUI code points (ITU-T H.273), as the decoders
-/// report it: BT.709 by default with the matrix guessed from the size, the signalled matrix and
-/// transfer when known, and full range when flagged. Shared by the software and hardware
-/// decoders so the two are interchangeable.
-pub fn vui_color(width: u32, height: u32, matrix: u8, transfer: u8, full_range: bool) -> filmcraft_color::ColorInfo {
+/// report it: BT.709 by default with the matrix guessed from the size, the signalled primaries,
+/// matrix and transfer when known, and full range when flagged. Shared by the software and
+/// hardware decoders so the two are interchangeable.
+pub fn vui_color(width: u32, height: u32, primaries: u8, matrix: u8, transfer: u8, full_range: bool) -> filmcraft_color::ColorInfo {
     let mut color = filmcraft_color::ColorInfo { matrix: filmcraft_frame::default_matrix(width, height), ..filmcraft_color::ColorInfo::REC709 };
+    if let Some(p) = primaries_from_code(primaries) {
+        color.primaries = p;
+    }
     if let Some(m) = filmcraft_color::Matrix::from_code(matrix) {
         color.matrix = m;
     }
@@ -167,16 +181,71 @@ pub fn hvcc_length_size_and_tid(hvcc: &[u8]) -> (usize, Option<u8>) {
 /// A factory returns `None` when it does not handle the entry.
 pub type VideoDecoderFactory = fn(&SampleEntry) -> Option<Result<Box<dyn VideoDecoder>>>;
 
+/// Read the Adobe APP14 transform byte needed for RGB/CMYK JPEG interpretation.
+fn jpeg_adobe_transform(jpeg: &[u8]) -> Option<u8> {
+    let mut at = 2usize;
+    if jpeg.get(..2) != Some(&[0xFF, 0xD8]) {
+        return None;
+    }
+    while at + 1 < jpeg.len() && jpeg[at] == 0xFF {
+        let marker = jpeg[at + 1];
+        if marker == 0xDA {
+            return None;
+        }
+        let len = usize::from(u16::from_be_bytes([*jpeg.get(at + 2)?, *jpeg.get(at + 3)?]));
+        if len < 2 {
+            return None;
+        }
+        let end = at.checked_add(2 + len)?;
+        let segment = jpeg.get(at + 4..end)?;
+        if marker == 0xEE && segment.get(..5) == Some(b"Adobe") {
+            return segment.get(11).copied();
+        }
+        at = end;
+    }
+    None
+}
+
 /// Motion-JPEG / Photo-JPEG (each sample is a complete JPEG).
 pub struct MjpegDecoder;
 
 impl VideoDecoder for MjpegDecoder {
     fn decode(&mut self, sample: &[u8], pts: i64) -> Result<Vec<DecodedFrame>> {
+        let sample = craft_jpeg::with_avi1_default_huffman(sample);
         // mjpa samples may contain two fields; decode the first image (field-merging lands with interlace support).
-        let img = image::load_from_memory_with_format(sample, image::ImageFormat::Jpeg).map_err(|e| CodecError::Decode(e.to_string()))?;
-        let rgba = img.to_rgba8();
-        let (w, h) = rgba.dimensions();
-        Ok(vec![DecodedFrame { pts, frame: VideoFrame::rgba8(w, h, rgba.into_raw()), draft: false }])
+        let adobe = jpeg_adobe_transform(&sample);
+        // `image::load_from_memory` previously used image::Limits::default(), which caps decoder
+        // allocations at 512 MiB and has no pixel-count limit. Keep that memory ceiling and avoid
+        // adding a separate pixel limit when routing through craft-jpeg.
+        let mut limits = craft_jpeg::Limits::default();
+        limits.max_pixels = u64::MAX;
+        limits.max_alloc = 512 << 20;
+        let decoded = craft_jpeg::decode(&sample, &limits, adobe).map_err(|e| CodecError::Decode(e.to_string()))?;
+        let craft_jpeg::Samples::U8(samples) = decoded.samples else {
+            return Err(CodecError::Decode("12-bit Motion JPEG is not supported by FilmCraft frames".into()));
+        };
+        let mut rgba = Vec::with_capacity(samples.len().saturating_mul(4));
+        match decoded.components {
+            1 => {
+                for &gray in &samples {
+                    rgba.extend_from_slice(&[gray, gray, gray, 255]);
+                }
+            }
+            3 => {
+                for rgb in samples.as_chunks::<3>().0 {
+                    rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+                }
+            }
+            4 => {
+                for cmyk in samples.as_chunks::<4>().0 {
+                    let (c, m, y, k) = (u16::from(cmyk[0]), u16::from(cmyk[1]), u16::from(cmyk[2]), u16::from(cmyk[3]));
+                    let rgb = [((255 - c) * (255 - k) / 255) as u8, ((255 - m) * (255 - k) / 255) as u8, ((255 - y) * (255 - k) / 255) as u8];
+                    rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+                }
+            }
+            n => return Err(CodecError::Decode(format!("unsupported JPEG component count {n}"))),
+        }
+        Ok(vec![DecodedFrame { pts, frame: VideoFrame::rgba8(decoded.width, decoded.height, rgba), draft: false }])
     }
     fn flush(&mut self) -> Vec<DecodedFrame> {
         Vec::new()
@@ -197,24 +266,41 @@ pub fn mjpeg_factory(e: &SampleEntry) -> Option<Result<Box<dyn VideoDecoder>>> {
 /// Our pure-Rust H.264 decoder (frame-threaded).
 pub struct H264Decoder {
     avcc: Vec<u8>,
-    dec: filmcraft_h264::Decoder,
+    dec: craft_video::h264::decode::Decoder,
     length_size: usize,
     draft: bool,
+    /// Worker threads (a background decoder gets fewer).
+    threads: usize,
 }
 
 impl H264Decoder {
+    /// The worker threads for a decoder made now.
+    fn threads_now() -> usize {
+        if filmcraft_media::cancel::background() { BACKGROUND_H264_THREADS.min(h264_threads()) } else { h264_threads() }
+    }
+
+    fn make_inner(avcc: &[u8], threads: usize) -> Result<craft_video::h264::decode::Decoder> {
+        let mut dec = craft_video::h264::decode::Decoder::with_threads(threads);
+        if !avcc.is_empty() {
+            dec.configure_avcc(avcc).map_err(h264_error)?;
+        }
+        Ok(dec)
+    }
+
     pub fn new(avcc: Vec<u8>) -> Result<Self> {
         recycle_h264_planes();
-        let dec = filmcraft_h264::Decoder::from_avcc(&avcc).map_err(|e| CodecError::Decode(e.to_string()))?;
+        let threads = Self::threads_now();
+        let dec = Self::make_inner(&avcc, threads)?;
         let length_size = avcc_length_size(&avcc);
-        Ok(Self { avcc, dec, length_size, draft: false })
+        Ok(Self { avcc, dec, length_size, draft: false, threads })
     }
     /// A decoder for Annex B byte-stream samples (start codes, in-band parameter sets: MXF, TS).
     pub fn annexb() -> Self {
         recycle_h264_planes();
-        Self { avcc: Vec::new(), dec: filmcraft_h264::Decoder::new(), length_size: 0, draft: false }
+        let threads = Self::threads_now();
+        Self { avcc: Vec::new(), dec: craft_video::h264::decode::Decoder::with_threads(threads), length_size: 0, draft: false, threads }
     }
-    fn convert(p: filmcraft_h264::Picture) -> DecodedFrame {
+    fn convert(p: craft_video::h264::decode::Picture) -> DecodedFrame {
         use std::sync::Arc;
         let draft = p.draft;
         let (w, h) = (p.width as usize, p.height as usize);
@@ -222,7 +308,7 @@ impl H264Decoder {
         let y = tight_plane(p.y, p.y_stride, w, h);
         let u = tight_plane(p.u, p.uv_stride, cw, ch);
         let v = tight_plane(p.v, p.uv_stride, cw, ch);
-        let color = vui_color(p.width, p.height, p.color.matrix, p.color.transfer, p.color.full_range);
+        let color = vui_color(p.width, p.height, p.color.primaries, p.color.matrix, p.color.transfer, p.color.full_range);
         let par = sar_par(p.sar);
         let frame = VideoFrame {
             width: p.width,
@@ -236,24 +322,35 @@ impl H264Decoder {
     }
 }
 
+/// An H.264 decoder error as a [`CodecError`]: a feature the decoder does not implement (High
+/// 4:2:2, field pictures...) is [`CodecError::Unsupported`], so the media pool shows the
+/// unreadable slate instead of a black picture (#626); anything else is a decode error.
+fn h264_error(e: craft_video::h264::decode::Error) -> CodecError {
+    match e {
+        craft_video::h264::decode::Error::Unsupported(what) => CodecError::Unsupported(format!("H.264: {what}")),
+        e => CodecError::Decode(e.to_string()),
+    }
+}
+
 impl VideoDecoder for H264Decoder {
     fn decode(&mut self, sample: &[u8], pts: i64) -> Result<Vec<DecodedFrame>> {
-        let pics = self.dec.decode(sample, pts).map_err(|e| CodecError::Decode(e.to_string()))?;
+        let pics = self.dec.decode(sample, pts).map_err(h264_error)?;
         Ok(pics.into_iter().map(Self::convert).collect())
     }
     fn flush(&mut self) -> Vec<DecodedFrame> {
         self.dec.flush().into_iter().map(Self::convert).collect()
     }
     fn reset(&mut self) {
-        if self.avcc.is_empty() {
-            self.dec = filmcraft_h264::Decoder::new();
-        } else if let Ok(d) = filmcraft_h264::Decoder::from_avcc(&self.avcc) {
-            self.dec = d;
+        self.dec.reset();
+        if !self.avcc.is_empty() {
+            let _ = self.dec.configure_avcc(&self.avcc);
         }
-        self.dec.set_draft(self.draft);
     }
     fn name(&self) -> &str {
         "FilmCraft H.264"
+    }
+    fn thread_limited(&self) -> bool {
+        self.threads < h264_threads()
     }
     fn set_draft(&mut self, on: bool) {
         self.draft = on;
@@ -266,20 +363,28 @@ impl VideoDecoder for H264Decoder {
         h264_disposable(sample, self.length_size)
     }
     fn is_random_access(&self, sample: &[u8]) -> Option<bool> {
-        // Annex B samples carry their parameter sets: an IDR access unit is a starting point.
-        (self.length_size == 0).then(|| filmcraft_bitstream::annexb_nals(sample).iter().any(|n| n.first().is_some_and(|h| h & 0x1f == 5)))
+        // Annex B samples carry their parameter sets: an IDR access unit is a starting point, and
+        // so is a non-IDR one with a recovery point SEI of recovery_frame_cnt 0 (open GOP), the
+        // same rule as the transport stream splitter's `key`.
+        (self.length_size == 0).then(|| {
+            filmcraft_bitstream::annexb_nals(sample).iter().any(|n| match n.first().map(|h| h & 0x1f) {
+                Some(5) => true,
+                Some(6) => craft_media::mpegts::sei_has_recovery_point(n),
+                _ => false,
+            })
+        })
     }
 }
 
 /// The H.264 decoder's output planes come from the frames the caches evicted
 /// (`filmcraft_frame::pool`) instead of the allocator.
 fn recycle_h264_planes() {
-    filmcraft_h264::set_plane_allocator(filmcraft_frame::pool::take_u8);
+    craft_video::h264::decode::set_plane_allocator(filmcraft_frame::pool::take_u8);
 }
 
 /// Worker threads each H.264 decoder uses (frame threading; 1 on wasm).
 pub fn h264_threads() -> usize {
-    filmcraft_h264::default_threads()
+    craft_video::h264::decode::default_threads()
 }
 
 pub fn h264_factory(e: &SampleEntry) -> Option<Result<Box<dyn VideoDecoder>>> {
@@ -289,30 +394,34 @@ pub fn h264_factory(e: &SampleEntry) -> Option<Result<Box<dyn VideoDecoder>>> {
     }
 }
 
-/// Our pure-Rust HEVC decoder (Main / Main 10, frame-threaded).
+/// Our pure-Rust HEVC decoder (Main / Main 10 and 4:2:2, frame-threaded).
 pub struct HevcDecoder {
     hvcc: Vec<u8>,
-    dec: filmcraft_hevc::Decoder,
+    dec: craft_video::hevc::decode::Decoder,
     length_size: usize,
     highest_tid: Option<u8>,
 }
 
 impl HevcDecoder {
     pub fn new(hvcc: Vec<u8>) -> Result<Self> {
-        let dec = filmcraft_hevc::Decoder::from_hvcc(&hvcc).map_err(|e| CodecError::Decode(e.to_string()))?;
+        let dec = craft_video::hevc::decode::Decoder::from_hvcc(&hvcc).map_err(hevc_error)?;
         let (length_size, highest_tid) = hvcc_length_size_and_tid(&hvcc);
         Ok(Self { hvcc, dec, length_size, highest_tid })
     }
     /// A decoder for Annex B byte-stream samples (start codes, in-band parameter sets: TS).
     pub fn annexb() -> Self {
-        Self { hvcc: Vec::new(), dec: filmcraft_hevc::Decoder::new(), length_size: 0, highest_tid: None }
+        Self { hvcc: Vec::new(), dec: craft_video::hevc::decode::Decoder::new(), length_size: 0, highest_tid: None }
     }
-    fn convert(p: filmcraft_hevc::Picture) -> DecodedFrame {
-        use filmcraft_hevc::Plane;
+    fn convert(p: craft_video::hevc::decode::Picture) -> DecodedFrame {
+        use craft_video::hevc::decode::{ChromaFormat, Plane};
         use std::sync::Arc;
         let (w, h) = (p.width as usize, p.height as usize);
         let (cw, ch) = (p.chroma_width as usize, p.chroma_height as usize);
         let (ys, uvs) = (p.y_stride, p.uv_stride);
+        let chroma = match p.chroma {
+            ChromaFormat::C420 => filmcraft_frame::Chroma::C420,
+            ChromaFormat::C422 => filmcraft_frame::Chroma::C422,
+        };
         let wide = |pl: Plane| -> Vec<u16> {
             match pl {
                 Plane::U16(v) => v,
@@ -322,26 +431,34 @@ impl HevcDecoder {
         let data = match (p.y, p.u, p.v) {
             (Plane::U8(y), Plane::U8(u), Plane::U8(v)) => filmcraft_frame::PixelData::Yuv8 {
                 planes: [Arc::new(tight_plane(y, ys, w, h)), Arc::new(tight_plane(u, uvs, cw, ch)), Arc::new(tight_plane(v, uvs, cw, ch))],
-                chroma: filmcraft_frame::Chroma::C420,
+                chroma,
                 alpha: None,
             },
             (y, u, v) => filmcraft_frame::PixelData::Yuv16 {
                 planes: [Arc::new(tight_plane(wide(y), ys, w, h)), Arc::new(tight_plane(wide(u), uvs, cw, ch)), Arc::new(tight_plane(wide(v), uvs, cw, ch))],
-                chroma: filmcraft_frame::Chroma::C420,
+                chroma,
                 bits: p.bit_depth,
                 alpha: None,
             },
         };
-        let color = vui_color(p.width, p.height, p.color.matrix, p.color.transfer, p.color.full_range);
+        let color = vui_color(p.width, p.height, p.color.primaries, p.color.matrix, p.color.transfer, p.color.full_range);
         let par = sar_par(p.sar);
         let frame = VideoFrame { width: p.width, height: p.height, data, color, par, pts: filmcraft_time::Tick::ZERO };
         DecodedFrame { pts: p.pts, frame, draft: p.draft }
     }
 }
 
+/// An HEVC decoder error as a [`CodecError`] (see [`h264_error`]).
+fn hevc_error(e: craft_video::hevc::decode::Error) -> CodecError {
+    match e {
+        craft_video::hevc::decode::Error::Unsupported(what) => CodecError::Unsupported(format!("HEVC: {what}")),
+        e => CodecError::Decode(e.to_string()),
+    }
+}
+
 impl VideoDecoder for HevcDecoder {
     fn decode(&mut self, sample: &[u8], pts: i64) -> Result<Vec<DecodedFrame>> {
-        let pics = self.dec.decode(sample, pts).map_err(|e| CodecError::Decode(e.to_string()))?;
+        let pics = self.dec.decode(sample, pts).map_err(hevc_error)?;
         Ok(pics.into_iter().map(Self::convert).collect())
     }
     fn flush(&mut self) -> Vec<DecodedFrame> {
@@ -349,8 +466,8 @@ impl VideoDecoder for HevcDecoder {
     }
     fn reset(&mut self) {
         if self.hvcc.is_empty() {
-            self.dec = filmcraft_hevc::Decoder::new();
-        } else if let Ok(d) = filmcraft_hevc::Decoder::from_hvcc(&self.hvcc) {
+            self.dec = craft_video::hevc::decode::Decoder::new();
+        } else if let Ok(d) = craft_video::hevc::decode::Decoder::from_hvcc(&self.hvcc) {
             self.dec = d;
         }
     }
@@ -381,7 +498,7 @@ pub fn hevc_factory(e: &SampleEntry) -> Option<Result<Box<dyn VideoDecoder>>> {
 /// Our pure-Rust VP9 decoder (profiles 0-3, 8/10/12-bit; tile columns and loop filter decode in
 /// parallel).
 pub struct Vp9Decoder {
-    dec: filmcraft_vp9::Decoder,
+    dec: craft_video::vp9::decode::Decoder,
     /// Container colour (vpcC / Matroska `Colour`): transfer and primaries are not in the VP9
     /// bitstream.
     transfer: Option<filmcraft_color::Transfer>,
@@ -404,40 +521,22 @@ pub(crate) fn primaries_from_code(c: u8) -> Option<filmcraft_color::Primaries> {
 impl Vp9Decoder {
     pub fn new(cfg: Option<&filmcraft_isobmff::VpcConfig>) -> Self {
         Self {
-            dec: filmcraft_vp9::Decoder::new(),
+            dec: craft_video::vp9::decode::Decoder::new(),
             transfer: cfg.and_then(|c| filmcraft_color::Transfer::from_code(c.transfer_characteristics)),
             primaries: cfg.and_then(|c| primaries_from_code(c.colour_primaries)),
         }
     }
 
     /// `None` for a picture whose planes mix sample types (never produced by the decoder).
-    fn convert(&self, p: filmcraft_vp9::Picture) -> Option<DecodedFrame> {
-        use filmcraft_color::{Matrix, Primaries, Range};
+    fn convert(&self, p: craft_video::vp9::decode::Picture) -> Option<DecodedFrame> {
+        use craft_video::vp9::decode::Plane;
+        use filmcraft_color::Range;
         use filmcraft_frame::{Chroma, PixelData};
-        use filmcraft_vp9::Plane;
         use std::sync::Arc;
         let (w, h) = (p.width as usize, p.height as usize);
         let (cw, ch) = (p.chroma_width as usize, p.chroma_height as usize);
-        let mut color = filmcraft_color::ColorInfo { matrix: filmcraft_frame::default_matrix(p.width, p.height), ..filmcraft_color::ColorInfo::REC709 };
-        // color_space (7.2.2): 1 BT.601, 2 BT.709, 3 SMPTE-170, 4 SMPTE-240, 5 BT.2020, 7 sRGB.
-        match p.color.color_space {
-            1 | 3 => color.matrix = Matrix::Bt601,
-            2 | 4 => color.matrix = Matrix::Bt709,
-            5 => {
-                color.matrix = Matrix::Bt2020Ncl;
-                color.primaries = Primaries::Bt2020;
-            }
-            _ => {}
-        }
-        if let Some(t) = self.transfer {
-            color.transfer = t;
-        }
-        if let Some(pr) = self.primaries {
-            color.primaries = pr;
-        }
-        if p.color.full_range {
-            color.range = Range::Full;
-        }
+        // (shared with the hardware decoders: `hw_frame::vp9_color`)
+        let color = crate::hw_frame::vp9_color(p.width, p.height, p.color.color_space, p.color.full_range, self.transfer, self.primaries);
         let (pts, draft) = (p.pts, p.draft);
         if p.color.color_space == 7 {
             // RGB (profiles 1 / 3, 4:4:4): the planes carry G, B, R.
@@ -507,7 +606,7 @@ impl VideoDecoder for Vp9Decoder {
         self.dec.set_draft(on);
     }
     fn is_random_access(&self, sample: &[u8]) -> Option<bool> {
-        Some(filmcraft_vp9::is_keyframe(sample))
+        Some(craft_video::vp9::decode::is_keyframe(sample))
     }
 }
 
@@ -518,43 +617,82 @@ pub fn vp9_factory(e: &SampleEntry) -> Option<Result<Box<dyn VideoDecoder>>> {
     }
 }
 
+/// VP8 container adapter (RFC 6386): WebM / Matroska `V_VP8` and MP4 `vp08`.
+/// The bitstream decoder is provided by craft-video; this adapter maps its pictures into FilmCraft frames.
+pub struct Vp8Decoder {
+    dec: craft_video::vp8::Decoder,
+}
+
+impl Default for Vp8Decoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Vp8Decoder {
+    pub fn new() -> Self {
+        // Preserve the 2^26 padded-luma-sample limit of the app-owned decoder.
+        Self { dec: craft_video::vp8::Decoder::with_max_luma_samples(1 << 26) }
+    }
+
+    fn convert(p: craft_video::vp8::Picture) -> DecodedFrame {
+        use filmcraft_frame::{Chroma, PixelData};
+        use std::sync::Arc;
+        // color_space 0 is BT.601 YUV (RFC 6386 9.2), studio swing; a container's Colour wins
+        let color = filmcraft_color::ColorInfo { matrix: filmcraft_color::Matrix::Bt601, ..filmcraft_color::ColorInfo::REC709 };
+        let data = PixelData::Yuv8 { planes: [Arc::new(p.y), Arc::new(p.u), Arc::new(p.v)], chroma: Chroma::C420, alpha: None };
+        let frame = VideoFrame { width: p.width, height: p.height, data, color, par: (1, 1), pts: filmcraft_time::Tick::ZERO };
+        DecodedFrame { pts: p.pts, frame, draft: false }
+    }
+}
+
+impl VideoDecoder for Vp8Decoder {
+    fn decode(&mut self, sample: &[u8], pts: i64) -> Result<Vec<DecodedFrame>> {
+        let pic = self.dec.decode(sample, pts).map_err(|e| CodecError::Decode(e.to_string()))?;
+        Ok(pic.map(Self::convert).into_iter().collect())
+    }
+    fn flush(&mut self) -> Vec<DecodedFrame> {
+        // no reordering: every picture comes out with its frame
+        Vec::new()
+    }
+    fn reset(&mut self) {
+        self.dec.reset();
+    }
+    fn name(&self) -> &str {
+        "FilmCraft VP8"
+    }
+    fn is_random_access(&self, sample: &[u8]) -> Option<bool> {
+        Some(craft_video::vp8::is_keyframe(sample))
+    }
+    fn is_disposable(&self, sample: &[u8]) -> bool {
+        self.dec.is_disposable(sample)
+    }
+}
+
+pub fn vp8_factory(e: &SampleEntry) -> Option<Result<Box<dyn VideoDecoder>>> {
+    (e.format.0 == *b"vp08").then(|| Ok(Box::new(Vp8Decoder::new()) as Box<dyn VideoDecoder>))
+}
+
 /// Our AV1 decoder. The `av1C` configuration OBUs (sequence header) are fed before the first
 /// sample and again after every reset.
 pub struct Av1Decoder {
-    dec: filmcraft_av1::Decoder,
+    dec: craft_video::av1::decode::Decoder,
     config_obus: Vec<u8>,
     primed: bool,
 }
 
 impl Av1Decoder {
     pub fn new(config_obus: Vec<u8>) -> Av1Decoder {
-        Av1Decoder { dec: filmcraft_av1::Decoder::new(), config_obus, primed: false }
+        Av1Decoder { dec: craft_video::av1::decode::Decoder::new(), config_obus, primed: false }
     }
 
-    fn convert(p: filmcraft_av1::Picture, pts: i64) -> DecodedFrame {
+    fn convert(p: craft_video::av1::decode::Picture, pts: i64) -> DecodedFrame {
         use std::sync::Arc;
         let draft = p.draft;
         let w = p.width as usize;
         let h = p.height as usize;
-        let mut color = filmcraft_color::ColorInfo::REC709;
-        if let Some(m) = filmcraft_color::Matrix::from_code(p.matrix_coefficients) {
-            color.matrix = m;
-        } else {
-            color.matrix = filmcraft_frame::default_matrix(p.width, p.height);
-        }
-        if let Some(t) = filmcraft_color::Transfer::from_code(p.transfer_characteristics) {
-            color.transfer = t;
-        }
-        color.primaries = match p.color_primaries {
-            9 => filmcraft_color::Primaries::Bt2020,
-            12 => filmcraft_color::Primaries::P3D65,
-            5 => filmcraft_color::Primaries::Bt601_625,
-            6 => filmcraft_color::Primaries::Bt601_525,
-            _ => filmcraft_color::Primaries::Bt709,
-        };
-        if p.full_range {
-            color.range = filmcraft_color::Range::Full;
-        }
+        // (shared with the hardware decoders: `hw_frame::av1_color`)
+        let color = crate::hw_frame::av1_color(p.width, p.height, p.matrix_coefficients, p.transfer_characteristics, p.color_primaries, p.full_range);
         let chroma = match (p.subsampling_x, p.subsampling_y) {
             (1, 1) => filmcraft_frame::Chroma::C420,
             (1, 0) => filmcraft_frame::Chroma::C422,
@@ -606,7 +744,7 @@ impl VideoDecoder for Av1Decoder {
             .collect()
     }
     fn reset(&mut self) {
-        self.dec = filmcraft_av1::Decoder::new();
+        self.dec = craft_video::av1::decode::Decoder::new();
         self.primed = false;
     }
     fn name(&self) -> &str {
@@ -616,7 +754,7 @@ impl VideoDecoder for Av1Decoder {
         self.dec.set_draft(on);
     }
     fn is_random_access(&self, sample: &[u8]) -> Option<bool> {
-        Some(filmcraft_av1::is_key_frame_unit(sample))
+        Some(craft_video::av1::decode::is_key_frame_unit(sample))
     }
 }
 
@@ -633,10 +771,10 @@ pub struct ProResDecoder;
 impl VideoDecoder for ProResDecoder {
     fn decode(&mut self, sample: &[u8], pts: i64) -> Result<Vec<DecodedFrame>> {
         use std::sync::Arc;
-        let f = filmcraft_prores::decode_frame(sample).map_err(|e| CodecError::Decode(e.to_string()))?;
+        let f = decode_prores_frame(sample).map_err(|e| CodecError::Decode(e.to_string()))?;
         let chroma = match f.chroma {
-            filmcraft_prores::ChromaFormat::Yuv422 => filmcraft_frame::Chroma::C422,
-            filmcraft_prores::ChromaFormat::Yuv444 => filmcraft_frame::Chroma::C444,
+            craft_video::prores::ChromaFormat::Yuv422 => filmcraft_frame::Chroma::C422,
+            craft_video::prores::ChromaFormat::Yuv444 => filmcraft_frame::Chroma::C444,
         };
         let mut color = filmcraft_color::ColorInfo::REC709;
         if let Some(m) = filmcraft_color::Matrix::from_code(f.color.matrix) {
@@ -681,11 +819,13 @@ pub fn prores_factory(e: &SampleEntry) -> Option<Result<Box<dyn VideoDecoder>>> 
 pub struct ApvDecoder;
 
 /// Convert a decoded APV frame to a [`VideoFrame`].
-pub fn apv_to_video_frame(f: filmcraft_apv::Frame) -> VideoFrame {
+pub fn apv_to_video_frame(f: craft_video::apv::Frame) -> VideoFrame {
     use std::sync::Arc;
     let chroma = match f.chroma {
-        filmcraft_apv::ChromaFormat::Yuv422 => filmcraft_frame::Chroma::C422,
-        filmcraft_apv::ChromaFormat::Monochrome | filmcraft_apv::ChromaFormat::Yuv444 | filmcraft_apv::ChromaFormat::Yuv4444 => filmcraft_frame::Chroma::C444,
+        craft_video::apv::ChromaFormat::Yuv422 => filmcraft_frame::Chroma::C422,
+        craft_video::apv::ChromaFormat::Monochrome | craft_video::apv::ChromaFormat::Yuv444 | craft_video::apv::ChromaFormat::Yuv4444 => {
+            filmcraft_frame::Chroma::C444
+        }
     };
     let mut color = filmcraft_color::ColorInfo { matrix: filmcraft_frame::default_matrix(f.width, f.height), ..filmcraft_color::ColorInfo::REC709 };
     if let Some(m) = filmcraft_color::Matrix::from_code(f.color.matrix) {
@@ -701,7 +841,7 @@ pub fn apv_to_video_frame(f: filmcraft_apv::Frame) -> VideoFrame {
         color.range = filmcraft_color::Range::Full;
     }
     let neutral = 1u16 << f.bit_depth.saturating_sub(1);
-    let (cb, cr) = if f.chroma == filmcraft_apv::ChromaFormat::Monochrome {
+    let (cb, cr) = if f.chroma == craft_video::apv::ChromaFormat::Monochrome {
         let u = vec![neutral; (f.width as usize) * (f.height as usize)];
         (u.clone(), u)
     } else {
@@ -723,7 +863,7 @@ pub fn apv_to_video_frame(f: filmcraft_apv::Frame) -> VideoFrame {
 
 impl VideoDecoder for ApvDecoder {
     fn decode(&mut self, sample: &[u8], pts: i64) -> Result<Vec<DecodedFrame>> {
-        let f = filmcraft_apv::decode_frame(sample).map_err(|e| CodecError::Decode(e.to_string()))?;
+        let f = craft_video::apv::decode_frame(sample).map_err(|e| CodecError::Decode(e.to_string()))?;
         Ok(vec![DecodedFrame { pts, frame: apv_to_video_frame(f), draft: false }])
     }
     fn flush(&mut self) -> Vec<DecodedFrame> {
@@ -816,7 +956,7 @@ pub fn dnx_factory(e: &SampleEntry) -> Option<Result<Box<dyn VideoDecoder>>> {
 
 /// Our MPEG-1 / MPEG-2 video decoder (Main / 4:2:2 profile, field and frame pictures).
 pub struct Mpeg2Decoder {
-    dec: filmcraft_mpeg2v::Decoder,
+    dec: craft_video::mpeg2::Decoder,
     /// Sequence header (and extensions) fed after a reset, so a random-access point without its
     /// own sequence header decodes (MKV `CodecPrivate`, or the stream's first header).
     header: Vec<u8>,
@@ -824,7 +964,7 @@ pub struct Mpeg2Decoder {
 
 impl Mpeg2Decoder {
     pub fn new(header: Vec<u8>) -> Self {
-        let mut d = Self { dec: filmcraft_mpeg2v::Decoder::new(), header };
+        let mut d = Self { dec: craft_video::mpeg2::Decoder::new(), header };
         d.prime();
         d
     }
@@ -838,7 +978,7 @@ impl Mpeg2Decoder {
 /// The sequence header with its extensions at the start of an MPEG video sample (up to the first
 /// GOP or picture start code).
 pub fn mpeg2_sequence_header(sample: &[u8]) -> Option<Vec<u8>> {
-    let codes = filmcraft_mpeg2v::start_codes(sample);
+    let codes = craft_video::mpeg2::start_codes(sample);
     let (start, _) = *codes.iter().find(|c| c.1 == 0xB3)?;
     let end = codes.iter().find(|c| c.0 > start && matches!(c.1, 0x00 | 0xB8 | 0x01..=0xAF)).map_or(sample.len(), |c| c.0);
     Some(sample[start..end].to_vec())
@@ -846,7 +986,7 @@ pub fn mpeg2_sequence_header(sample: &[u8]) -> Option<Vec<u8>> {
 
 /// Convert a decoded MPEG-1/2 picture. Colour comes from the sequence display extension
 /// (defaults: BT.601 for SD, BT.709 for HD); the pixel aspect from the aspect ratio code.
-pub fn mpeg2_to_video_frame(p: filmcraft_mpeg2v::Picture) -> VideoFrame {
+pub fn mpeg2_to_video_frame(p: craft_video::mpeg2::Picture) -> VideoFrame {
     use std::sync::Arc;
     let info = &p.info;
     let mut color = filmcraft_color::ColorInfo { matrix: filmcraft_frame::default_matrix(p.width, p.height), ..filmcraft_color::ColorInfo::REC709 };
@@ -865,9 +1005,9 @@ pub fn mpeg2_to_video_frame(p: filmcraft_mpeg2v::Picture) -> VideoFrame {
         }
     }
     let chroma = match p.chroma {
-        filmcraft_mpeg2v::ChromaFormat::Yuv420 => filmcraft_frame::Chroma::C420,
-        filmcraft_mpeg2v::ChromaFormat::Yuv422 => filmcraft_frame::Chroma::C422,
-        filmcraft_mpeg2v::ChromaFormat::Yuv444 => filmcraft_frame::Chroma::C444,
+        craft_video::mpeg2::ChromaFormat::Yuv420 => filmcraft_frame::Chroma::C420,
+        craft_video::mpeg2::ChromaFormat::Yuv422 => filmcraft_frame::Chroma::C422,
+        craft_video::mpeg2::ChromaFormat::Yuv444 => filmcraft_frame::Chroma::C444,
     };
     let par = info.sar;
     VideoFrame {
@@ -881,15 +1021,15 @@ pub fn mpeg2_to_video_frame(p: filmcraft_mpeg2v::Picture) -> VideoFrame {
 }
 
 /// "YUV 4:2:2 8-bit, interlaced (upper field first)" for the media info.
-pub fn mpeg2_pixel_format(info: &filmcraft_mpeg2v::SequenceInfo, field_order: Option<filmcraft_mpeg2v::FieldOrder>) -> String {
+pub fn mpeg2_pixel_format(info: &craft_video::mpeg2::SequenceInfo, field_order: Option<craft_video::mpeg2::FieldOrder>) -> String {
     let sub = match info.chroma {
-        filmcraft_mpeg2v::ChromaFormat::Yuv420 => "4:2:0",
-        filmcraft_mpeg2v::ChromaFormat::Yuv422 => "4:2:2",
-        filmcraft_mpeg2v::ChromaFormat::Yuv444 => "4:4:4",
+        craft_video::mpeg2::ChromaFormat::Yuv420 => "4:2:0",
+        craft_video::mpeg2::ChromaFormat::Yuv422 => "4:2:2",
+        craft_video::mpeg2::ChromaFormat::Yuv444 => "4:4:4",
     };
     let scan = match field_order {
-        Some(filmcraft_mpeg2v::FieldOrder::TopFirst) => ", interlaced (upper field first)",
-        Some(filmcraft_mpeg2v::FieldOrder::BottomFirst) => ", interlaced (lower field first)",
+        Some(craft_video::mpeg2::FieldOrder::TopFirst) => ", interlaced (upper field first)",
+        Some(craft_video::mpeg2::FieldOrder::BottomFirst) => ", interlaced (lower field first)",
         None => ", progressive",
     };
     format!("YUV {sub} 8-bit{scan}")
@@ -911,10 +1051,10 @@ impl VideoDecoder for Mpeg2Decoder {
         "FilmCraft MPEG-2"
     }
     fn is_random_access(&self, sample: &[u8]) -> Option<bool> {
-        Some(filmcraft_mpeg2v::scan_access_unit(sample).is_intra())
+        Some(craft_video::mpeg2::scan_access_unit(sample).is_intra())
     }
     fn is_disposable(&self, sample: &[u8]) -> bool {
-        filmcraft_mpeg2v::scan_access_unit(sample).is_disposable()
+        craft_video::mpeg2::scan_access_unit(sample).is_disposable()
     }
 }
 
@@ -969,6 +1109,13 @@ fn esds_object_type(raw: &[u8]) -> Option<u8> {
     raw.get(p).copied()
 }
 
+/// Uncompressed QuickTime / MP4 video (`raw ` 24-bit RGB, `2vuy`, `v210`, #2340).
+pub fn raw_factory(e: &SampleEntry) -> Option<Result<Box<dyn VideoDecoder>>> {
+    let v = e.video.as_ref()?;
+    let format = RawFormat::from_mov(e.format.0, v.depth)?;
+    Some(RawVideoDecoder::new(format, u32::from(v.width), u32::from(v.height), false).map(|d| Box::new(d) as Box<dyn VideoDecoder>))
+}
+
 pub fn mpeg2_factory(e: &SampleEntry) -> Option<Result<Box<dyn VideoDecoder>>> {
     match &e.codec {
         CodecConfig::Unknown { fourcc, raw } if is_mpeg2_entry(&fourcc.0, raw) => {
@@ -1021,5 +1168,324 @@ mod disposable_tests {
         assert!(!hevc_disposable(&sample(&[&nal(0, 1)]), 4, Some(1)));
         // unknown layering: never
         assert!(!hevc_disposable(&sample(&[&nal(0, 1)]), 4, None));
+    }
+}
+
+#[cfg(test)]
+mod hevc_convert_tests {
+    use super::HevcDecoder;
+    use craft_video::hevc::decode::{ChromaFormat, ColorInfo, Picture, Plane};
+    use filmcraft_frame::{Chroma, PixelData};
+
+    /// A 4x2 picture whose chroma planes are 2 samples wide and `chroma_height` rows high.
+    fn picture(chroma: ChromaFormat, chroma_height: u32, wide: bool) -> Picture {
+        let plane = |n: usize, v: u16| if wide { Plane::U16(vec![v; n]) } else { Plane::U8(vec![v as u8; n]) };
+        let uv = 2 * chroma_height as usize;
+        Picture {
+            width: 4,
+            height: 2,
+            chroma_width: 2,
+            chroma_height,
+            chroma,
+            bit_depth: if wide { 10 } else { 8 },
+            y: plane(8, 64),
+            u: plane(uv, 128),
+            v: plane(uv, 128),
+            y_stride: 4,
+            uv_stride: 2,
+            pts: 0,
+            poc: 0,
+            key: true,
+            color: ColorInfo { full_range: false, primaries: 1, transfer: 1, matrix: 1 },
+            sar: (1, 1),
+            draft: false,
+        }
+    }
+
+    fn chroma_of(data: &PixelData) -> Option<(Chroma, usize)> {
+        match data {
+            PixelData::Yuv8 { planes, chroma, .. } => Some((*chroma, planes[1].len())),
+            PixelData::Yuv16 { planes, chroma, .. } => Some((*chroma, planes[1].len())),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn frames_keep_the_decoded_chroma_sampling() {
+        for wide in [false, true] {
+            let f = HevcDecoder::convert(picture(ChromaFormat::C420, 1, wide));
+            assert_eq!(chroma_of(&f.frame.data), Some((Chroma::C420, 2)), "4:2:0, 16-bit {wide}");
+            let f = HevcDecoder::convert(picture(ChromaFormat::C422, 2, wide));
+            assert_eq!(chroma_of(&f.frame.data), Some((Chroma::C422, 4)), "4:2:2, 16-bit {wide}");
+        }
+    }
+}
+
+/// Uncompressed video layouts (AVI `BI_RGB` and YUV FourCCs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawFormat {
+    /// 24-bit B, G, R; rows padded to 4 bytes.
+    Bgr24,
+    /// 32-bit B, G, R, X.
+    Bgrx32,
+    /// Packed 4:2:2: Y0 U Y1 V (`YUY2`, `YUYV`).
+    Yuy2,
+    /// Packed 4:2:2: U Y0 V Y1 (`UYVY`, `2vuy`).
+    Uyvy,
+    /// Planar 4:2:0: Y, U, V (`I420`, `IYUV`).
+    I420,
+    /// Planar 4:2:0: Y, V, U (`YV12`).
+    Yv12,
+    /// Y plane, interleaved U V at half resolution (`NV12`).
+    Nv12,
+    /// Luma only (`Y800`, `GREY`, `Y8  `).
+    Gray8,
+    /// 24-bit R, G, B; rows unpadded (QuickTime `raw ` at depth 24).
+    Rgb24,
+    /// 10-bit 4:2:2 Y'CbCr, six pixels in four little-endian words, rows padded to 128 bytes
+    /// (QuickTime `v210`); shown at 8 bits.
+    V210,
+}
+
+impl RawFormat {
+    /// The layout of an AVI video stream: `BI_RGB` with its bit count, or a YUV FourCC.
+    pub fn from_avi(compression: [u8; 4], bit_count: u16) -> Option<RawFormat> {
+        if matches!(u32::from_le_bytes(compression), 0 | 3) {
+            return match bit_count {
+                24 => Some(RawFormat::Bgr24),
+                32 => Some(RawFormat::Bgrx32),
+                _ => None,
+            };
+        }
+        let mut upper = compression;
+        upper.make_ascii_uppercase();
+        Some(match &upper {
+            b"YUY2" | b"YUYV" | b"YUNV" | b"V422" => RawFormat::Yuy2,
+            b"UYVY" | b"2VUY" | b"UYNV" | b"HDYC" => RawFormat::Uyvy,
+            b"I420" | b"IYUV" => RawFormat::I420,
+            b"YV12" => RawFormat::Yv12,
+            b"NV12" => RawFormat::Nv12,
+            b"Y800" | b"GREY" | b"GRAY" | b"Y8  " => RawFormat::Gray8,
+            _ => return None,
+        })
+    }
+
+    /// The layout of a QuickTime / MP4 video sample entry (`raw ` RGB at depth 24, `2vuy`, `v210`).
+    pub fn from_mov(fourcc: [u8; 4], depth: u16) -> Option<RawFormat> {
+        match (&fourcc, depth) {
+            (b"raw ", 24) => Some(RawFormat::Rgb24),
+            (b"2vuy", _) => Some(RawFormat::Uyvy),
+            (b"v210", _) => Some(RawFormat::V210),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RawFormat::Bgr24 | RawFormat::Rgb24 => "Uncompressed RGB 24-bit",
+            RawFormat::Bgrx32 => "Uncompressed RGB 32-bit",
+            RawFormat::Yuy2 | RawFormat::Uyvy => "Uncompressed YUV 4:2:2",
+            RawFormat::I420 | RawFormat::Yv12 | RawFormat::Nv12 => "Uncompressed YUV 4:2:0",
+            RawFormat::Gray8 => "Uncompressed greyscale",
+            RawFormat::V210 => "Uncompressed YUV 4:2:2 10-bit",
+        }
+    }
+}
+
+/// Uncompressed frames (each sample one picture of a [`RawFormat`]).
+pub struct RawVideoDecoder {
+    format: RawFormat,
+    width: u32,
+    height: u32,
+    /// RGB rows are stored bottom-up (a positive `BITMAPINFOHEADER` height).
+    bottom_up: bool,
+}
+
+impl RawVideoDecoder {
+    pub fn new(format: RawFormat, width: u32, height: u32, bottom_up: bool) -> Result<Self> {
+        if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
+            return Err(CodecError::Unsupported(format!("{width}x{height} uncompressed video")));
+        }
+        Ok(Self { format, width, height, bottom_up })
+    }
+
+    fn yuv(&self, planes: [Vec<u8>; 3], chroma: filmcraft_frame::Chroma) -> VideoFrame {
+        use std::sync::Arc;
+        let [y, u, v] = planes;
+        VideoFrame {
+            width: self.width,
+            height: self.height,
+            data: filmcraft_frame::PixelData::Yuv8 { planes: [Arc::new(y), Arc::new(u), Arc::new(v)], chroma, alpha: None },
+            color: vui_color(self.width, self.height, 2, 2, 2, false),
+            par: (1, 1),
+            pts: filmcraft_time::Tick::ZERO,
+        }
+    }
+
+    fn picture(&self, s: &[u8]) -> Result<VideoFrame> {
+        let (w, h) = (self.width as usize, self.height as usize);
+        let short = || CodecError::Decode(format!("{} frame of {} bytes is too short for {w}x{h}", self.format.label(), s.len()));
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        Ok(match self.format {
+            RawFormat::Bgr24 | RawFormat::Bgrx32 => {
+                let bpp = if self.format == RawFormat::Bgr24 { 3 } else { 4 };
+                let stride = (w * bpp).div_ceil(4) * 4;
+                if s.len() < stride * h {
+                    return Err(short());
+                }
+                let mut rgba = Vec::with_capacity(w * h * 4);
+                for row in 0..h {
+                    let src = if self.bottom_up { h - 1 - row } else { row };
+                    for px in s.get(src * stride..src * stride + w * bpp).unwrap_or_default().chunks_exact(bpp) {
+                        rgba.extend_from_slice(&[px[2], px[1], px[0], 255]);
+                    }
+                }
+                VideoFrame::rgba8(self.width, self.height, rgba)
+            }
+            RawFormat::Rgb24 => {
+                let stride = w * 3;
+                if s.len() < stride * h {
+                    return Err(short());
+                }
+                let mut rgba = Vec::with_capacity(w * h * 4);
+                for px in s.get(..stride * h).unwrap_or_default().as_chunks::<3>().0 {
+                    rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+                }
+                VideoFrame::rgba8(self.width, self.height, rgba)
+            }
+            RawFormat::V210 => {
+                // 6 pixels per 16 bytes; each row padded to a multiple of 128 bytes (48 pixels)
+                let stride = w.div_ceil(48) * 128;
+                if s.len() < stride * h {
+                    return Err(short());
+                }
+                let (mut y, mut u, mut v) = (Vec::with_capacity(w * h), Vec::with_capacity(cw * h), Vec::with_capacity(cw * h));
+                for row in s.chunks_exact(stride).take(h) {
+                    // the row's 10-bit samples in order: Cb Y Cr Y Cb Y Cr Y …, kept at 8 bits
+                    let mut comps = row.as_chunks::<4>().0.iter().flat_map(|b| {
+                        let word = u32::from_le_bytes(*b);
+                        [word & 0x3ff, (word >> 10) & 0x3ff, (word >> 20) & 0x3ff].map(|c| (c >> 2) as u8)
+                    });
+                    for x in 0..cw {
+                        let (Some(cb), Some(y0), Some(cr), Some(y1)) = (comps.next(), comps.next(), comps.next(), comps.next()) else { break };
+                        u.push(cb);
+                        v.push(cr);
+                        y.push(y0);
+                        if 2 * x + 1 < w {
+                            y.push(y1);
+                        }
+                    }
+                }
+                self.yuv([y, u, v], filmcraft_frame::Chroma::C422)
+            }
+            RawFormat::Yuy2 | RawFormat::Uyvy => {
+                let stride = cw * 4;
+                if s.len() < stride * h {
+                    return Err(short());
+                }
+                let (yo, uo, vo, y2) = if self.format == RawFormat::Yuy2 { (0, 1, 3, 2) } else { (1, 0, 2, 3) };
+                let (mut y, mut u, mut v) = (Vec::with_capacity(w * h), Vec::with_capacity(cw * h), Vec::with_capacity(cw * h));
+                for row in s.chunks_exact(stride).take(h) {
+                    for (k, q) in row.as_chunks::<4>().0.iter().enumerate() {
+                        y.push(q[yo]);
+                        if 2 * k + 1 < w {
+                            y.push(q[y2]);
+                        }
+                        u.push(q[uo]);
+                        v.push(q[vo]);
+                    }
+                }
+                self.yuv([y, u, v], filmcraft_frame::Chroma::C422)
+            }
+            RawFormat::I420 | RawFormat::Yv12 | RawFormat::Nv12 | RawFormat::Gray8 => {
+                let luma = w * h;
+                let need = if self.format == RawFormat::Gray8 { luma } else { luma + 2 * cw * ch };
+                if s.len() < need {
+                    return Err(short());
+                }
+                let y = s.get(..luma).unwrap_or_default().to_vec();
+                let (u, v) = match self.format {
+                    RawFormat::Gray8 => (vec![128; cw * ch], vec![128; cw * ch]),
+                    RawFormat::Nv12 => s.get(luma..luma + 2 * cw * ch).unwrap_or_default().as_chunks::<2>().0.iter().map(|p| (p[0], p[1])).unzip(),
+                    _ => {
+                        let a = s.get(luma..luma + cw * ch).unwrap_or_default().to_vec();
+                        let b = s.get(luma + cw * ch..luma + 2 * cw * ch).unwrap_or_default().to_vec();
+                        if self.format == RawFormat::Yv12 { (b, a) } else { (a, b) }
+                    }
+                };
+                self.yuv([y, u, v], filmcraft_frame::Chroma::C420)
+            }
+        })
+    }
+}
+
+impl VideoDecoder for RawVideoDecoder {
+    fn decode(&mut self, sample: &[u8], pts: i64) -> Result<Vec<DecodedFrame>> {
+        Ok(vec![DecodedFrame { pts, frame: self.picture(sample)?, draft: false }])
+    }
+    fn flush(&mut self) -> Vec<DecodedFrame> {
+        Vec::new()
+    }
+    fn reset(&mut self) {}
+    fn name(&self) -> &str {
+        self.format.label()
+    }
+    fn intra_only(&self) -> bool {
+        true
+    }
+}
+
+/// Decode with FilmCraft's historical 1 GiB ProRes output-plane ceiling.
+fn decode_prores_frame(sample: &[u8]) -> std::result::Result<craft_video::prores::Frame, craft_video::prores::Error> {
+    let limits = craft_video::prores::DecodeLimits { max_pixels: u64::MAX, max_frame_bytes: 1 << 30 };
+    craft_video::prores::decode_frame_with_limits(sample, &craft_video::prores::DecodeOptions::default(), &limits)
+}
+
+#[cfg(test)]
+mod prores_resource_tests {
+    use super::*;
+    use craft_video::prores::{AlphaType, ChromaFormat, ColorInfo, FrameHeader, Interlace};
+
+    fn header(width: u16, height: u16) -> Vec<u8> {
+        let h = FrameHeader {
+            header_size: 20,
+            bitstream_version: 1,
+            encoder_id: *b"test",
+            width,
+            height,
+            chroma: ChromaFormat::Yuv444,
+            interlace: Interlace::Progressive,
+            aspect_ratio: 0,
+            frame_rate_code: 0,
+            color: ColorInfo::default(),
+            alpha: AlphaType::Bits16,
+            qmat_luma: [4; 64],
+            qmat_chroma: [4; 64],
+            luma_matrix_present: false,
+            chroma_matrix_present: false,
+        }
+        .write();
+        let size = 8 + h.len();
+        let mut data = Vec::with_capacity(size);
+        data.extend_from_slice(&(size as u32).to_be_bytes());
+        data.extend_from_slice(b"icpf");
+        data.extend_from_slice(&h);
+        data
+    }
+
+    #[test]
+    fn prores_decoder_preserves_the_one_gibibyte_plane_limit() {
+        // 4:4:4 + 16-bit alpha: four u16 planes. This is 960,000,000 output bytes,
+        // above craft-video's default 300 MiB but below FilmCraft's prior 1 GiB ceiling.
+        let data = header(12_000, 10_000);
+        assert!(matches!(decode_prores_frame(&data), Err(craft_video::prores::Error::Truncated)));
+        assert!(matches!(
+            craft_video::prores::decode_frame(&data),
+            Err(craft_video::prores::Error::Invalid("frame dimensions exceed the decoder memory limit"))
+        ));
+
+        // 1,120,000,000 bytes is beyond the old ceiling and must fail before allocation.
+        let too_large = header(14_000, 10_000);
+        assert!(matches!(decode_prores_frame(&too_large), Err(craft_video::prores::Error::Invalid("frame dimensions exceed the decoder memory limit"))));
     }
 }
