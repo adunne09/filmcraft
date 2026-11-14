@@ -392,6 +392,8 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
     /// Lay out a storyline, refusing nesting past [`MAX_XML_DEPTH`].
     fn storyline(&mut self, seq: &mut Sequence, ctx: &Ctx, spine: Node<'a, 'i>, origin: Tick, lane: i32, primary: bool) {
         if self.depth >= MAX_XML_DEPTH {
+            // Cached media must be retried when a shallower reference can fit the skipped clips.
+            self.depth_hits += 1;
             self.report.warn(format!("XML storylines are nested more than {MAX_XML_DEPTH} deep; deeper clips were skipped"));
             return;
         }
@@ -462,6 +464,8 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
     /// Lay out one element, refusing nesting past [`MAX_XML_DEPTH`].
     fn element(&mut self, seq: &mut Sequence, ctx: &Ctx, el: Node<'a, 'i>, t0: Tick, lane: i32, primary: bool) -> (Tick, Option<filmcraft_project::ClipId>) {
         if self.depth >= MAX_XML_DEPTH {
+            // Propagate XML truncation to the enclosing media cache, just like its resource limit.
+            self.depth_hits += 1;
             self.report.warn(format!("XML elements are nested more than {MAX_XML_DEPTH} deep; deeper clips were skipped"));
             return (t0, None);
         }
