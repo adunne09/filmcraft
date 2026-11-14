@@ -10,6 +10,7 @@ struct PatchButton<'a> {
     rect: Rect,
     clip: Rect,
     label: &'a str,
+    action: &'a str,
     active: bool,
     show_inactive: bool,
     id: egui::Id,
@@ -17,8 +18,9 @@ struct PatchButton<'a> {
 }
 
 fn patch_button(ui: &mut egui::Ui, button: PatchButton<'_>) -> egui::Response {
-    let PatchButton { rect: r, clip, label, active: on, show_inactive: show_off, id, tokens: t } = button;
-    let resp = ui.interact(r.intersect(clip), id, Sense::click());
+    let PatchButton { rect: r, clip, label, action, active: on, show_inactive: show_off, id, tokens: t } = button;
+    let resp = ui.interact(crate::widgets::clipped_hit_rect(r, clip), id, Sense::click());
+    crate::widgets::button_accessibility(&resp, &format!("{action} {label}"), Some(on));
     let p = ui.painter().with_clip_rect(clip);
     if on {
         p.rect_filled(r, 2.0, t.track_target);
@@ -73,6 +75,7 @@ pub(super) fn draw_headers(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequ
             p.rect_filled(Rect::from_min_max(strip.min, pos2(strip.min.x + 5.0, strip.max.y)), 0.0, c);
         }
         let cresp = ui.interact(strip.intersect(visible), egui::Id::unique(("trackColor", r.track.0)), Sense::click()).on_hover_text(tl!("Track Color"));
+        crate::widgets::button_accessibility(&cresp, &format!("{} {label}", tl!("Track Color")), None);
         app.auto.add(&format!("timeline.track.{}{}.color", if r.kind == TrackKind::Video { "V" } else { "A" }, r.index + 1), strip, "Track Color");
         if cresp.hovered() && tr.label.is_none() {
             p.rect_filled(Rect::from_min_max(strip.min, pos2(strip.min.x + 5.0, strip.max.y)), 0.0, t.hover);
@@ -109,6 +112,7 @@ pub(super) fn draw_headers(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequ
                 rect: pr,
                 clip: visible,
                 label: &label,
+                action: tl!("Source Patch"),
                 active: patched,
                 show_inactive: false,
                 id: egui::Id::unique(("patch", r.track.0)),
@@ -124,14 +128,16 @@ pub(super) fn draw_headers(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequ
         let lock_r = small(49.0, hrect.center().y);
         let lresp = crate::widgets::icon_toggle(
             ui,
-            lock_r.intersect(visible),
+            crate::widgets::clipped_hit_rect(lock_r, visible),
             if tr.locked { Icon::Lock } else { Icon::Unlock },
             true,
             t,
             egui::Id::unique(("locked", r.track.0)),
             Some(if tr.locked { t.icon_active } else { t.text_dim }),
         );
-        app.auto.add(&format!("timeline.track.{label}.locked"), lock_r, "Toggle Track Lock");
+        let lock_label = format!("{} {label}", tl!("Lock"));
+        crate::widgets::button_accessibility(&lresp, &lock_label, Some(tr.locked));
+        app.auto.add_response(&format!("timeline.track.{label}.locked"), &lresp, &lock_label);
         if lresp.clicked() {
             actions.push(("timeline.setTrack".into(), json!({"track": r.track.0, "locked": !tr.locked})));
         }
@@ -149,6 +155,7 @@ pub(super) fn draw_headers(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequ
                 rect: trr,
                 clip: visible,
                 label: &label,
+                action: tl!("Target"),
                 active: targeted,
                 show_inactive: true,
                 id: egui::Id::unique(("target", r.track.0)),
@@ -230,9 +237,18 @@ fn header_line_buttons(
     let small = |x: f32, y: f32| Rect::from_center_size(pos2(hrect.min.x + x, y), vec2(18.0, 18.0));
     let mut x = 102.0;
     let sr = small(x, upper_y);
-    let sresp =
-        crate::widgets::icon_toggle(ui, sr.intersect(visible), Icon::SyncLock, tr.sync_lock, t, egui::Id::unique(("syncLock", r.track.0)), Some(t.text_dim));
-    app.auto.add(&format!("timeline.track.{label}.syncLock"), sr, "Toggle Sync Lock");
+    let sresp = crate::widgets::icon_toggle(
+        ui,
+        crate::widgets::clipped_hit_rect(sr, visible),
+        Icon::SyncLock,
+        tr.sync_lock,
+        t,
+        egui::Id::unique(("syncLock", r.track.0)),
+        Some(t.text_dim),
+    );
+    let sync_label = format!("{} {label}", tl!("Sync Lock"));
+    crate::widgets::button_accessibility(&sresp, &sync_label, Some(tr.sync_lock));
+    app.auto.add_response(&format!("timeline.track.{label}.syncLock"), &sresp, &sync_label);
     if sresp.clicked() {
         actions.push(("timeline.setTrack".into(), json!({"track": r.track.0, "syncLock": !tr.sync_lock})));
     }
@@ -241,14 +257,16 @@ fn header_line_buttons(
         let er = small(x, upper_y);
         let eresp = crate::widgets::icon_toggle(
             ui,
-            er.intersect(visible),
+            crate::widgets::clipped_hit_rect(er, visible),
             if tr.enabled { Icon::Eye } else { Icon::EyeOff },
             true,
             t,
             egui::Id::unique(("enabled", r.track.0)),
             Some(t.text_dim),
         );
-        app.auto.add(&format!("timeline.track.{label}.enabled"), er, "Toggle Track Output");
+        let output_label = format!("{} {label}", tl!("Track Output"));
+        crate::widgets::button_accessibility(&eresp, &output_label, Some(tr.enabled));
+        app.auto.add_response(&format!("timeline.track.{label}.enabled"), &eresp, &output_label);
         if eresp.clicked() {
             actions.push(("timeline.setTrack".into(), json!({"track": r.track.0, "enabled": !tr.enabled})));
         }
@@ -264,14 +282,18 @@ fn header_line_buttons(
             t,
             egui::Id::unique(("mute", r.track.0)),
         );
-        app.auto.add(&format!("timeline.track.{label}.muted"), mr, "Mute Track");
+        let mute_label = format!("{} {label}", tl!("Mute"));
+        crate::widgets::button_accessibility(&mresp, &mute_label, Some(tr.muted));
+        app.auto.add_response(&format!("timeline.track.{label}.muted"), &mresp, &mute_label);
         if mresp.clicked() {
             actions.push(("timeline.setTrack".into(), json!({"track": r.track.0, "muted": !tr.muted})));
         }
         let s2 = Rect::from_center_size(pos2(hrect.min.x + x + 20.0, upper_y), vec2(14.0, 14.0));
         let so =
             crate::widgets::letter_toggle_clipped(ui, s2, visible, "S", tr.solo, Color32::from_rgb(0xf0, 0xf0, 0x4f), t, egui::Id::unique(("solo", r.track.0)));
-        app.auto.add(&format!("timeline.track.{label}.solo"), s2, "Solo Track");
+        let solo_label = format!("{} {label}", tl!("Solo"));
+        crate::widgets::button_accessibility(&so, &solo_label, Some(tr.solo));
+        app.auto.add_response(&format!("timeline.track.{label}.solo"), &so, &solo_label);
         if so.clicked() {
             actions.push(("timeline.setTrack".into(), json!({"track": r.track.0, "solo": !tr.solo})));
         }

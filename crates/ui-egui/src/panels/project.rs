@@ -578,7 +578,8 @@ fn footer(app: &mut FilmcraftApp, ui: &mut egui::Ui, bar: Rect, v: &View, action
     ] {
         let r = Rect::from_min_size(pos2(x, bar.min.y + 5.0), vec2(26.0, 22.0));
         let resp = ui.interact(r, egui::Id::unique((pre, "pv", tip)), Sense::click()).on_hover_text(tip);
-        app.auto.add(&format!("{pre}.view.{mode:?}"), r, tip);
+        crate::widgets::button_accessibility(&resp, tip, Some(v.mode == mode));
+        app.auto.add_response(&format!("{pre}.view.{mode:?}"), &resp, tip);
         if v.mode == mode {
             ui.painter().rect_filled(r, 4.0, t.pressed);
         } else if resp.hovered() {
@@ -632,7 +633,8 @@ fn footer(app: &mut FilmcraftApp, ui: &mut egui::Ui, bar: Rect, v: &View, action
     if v.mode == ViewMode::Icon {
         let r = Rect::from_min_size(pos2(x, bar.min.y + 5.0), vec2(24.0, 22.0));
         let resp = ui.interact(r, egui::Id::unique((pre, "sortIcons")), Sense::click()).on_hover_text(tl!("Sort Icons"));
-        app.auto.add(&format!("{pre}.sortIcons"), r, "Sort Icons");
+        crate::widgets::button_accessibility(&resp, tl!("Sort Icons"), None);
+        app.auto.add_response(&format!("{pre}.sortIcons"), &resp, "Sort Icons");
         if resp.hovered() {
             ui.painter().rect_filled(r, 3.0, t.hover);
         }
@@ -657,8 +659,9 @@ fn footer(app: &mut FilmcraftApp, ui: &mut egui::Ui, bar: Rect, v: &View, action
             "clip.automateToSequence" => automate,
             _ => true,
         };
-        let resp = ui.interact(r, egui::Id::unique((pre, "pb", id)), Sense::click()).on_hover_text(tip);
-        app.auto.add(&format!("{pre}.button.{id}"), r, tip);
+        let resp = ui.add_enabled_ui(enabled, |ui| ui.interact(r, egui::Id::unique((pre, "pb", id)), Sense::click())).inner.on_hover_text(tip);
+        crate::widgets::button_accessibility(&resp, tip, None);
+        app.auto.add_response(&format!("{pre}.button.{id}"), &resp, tip);
         if resp.hovered() && enabled {
             ui.painter().rect_filled(r, 3.0, t.hover);
         }

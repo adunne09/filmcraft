@@ -1126,7 +1126,8 @@ fn transport(app: &mut FilmcraftApp, ui: &mut egui::Ui, row: Rect, which: Which)
         // Customize this monitor's transport separately from the other monitor.
         let r = Rect::from_min_size(pos2(row.max.x - 30.0, row.min.y + 5.0), vec2(22.0, 22.0));
         let resp = ui.interact(r, egui::Id::unique((prefix, "btn-editor")), Sense::click()).on_hover_text(tl!("Button Editor"));
-        app.auto.add(&format!("{prefix}.transport.editor"), r, "Button Editor");
+        crate::widgets::button_accessibility(&resp, &format!("{}: {}", if src { tl!("Source") } else { tl!("Program") }, tl!("Button Editor")), None);
+        app.auto.add_response(&format!("{prefix}.transport.editor"), &resp, "Button Editor");
         icons::paint(ui.painter(), r.shrink(5.0), Icon::Plus, if resp.hovered() { t.tab_text_active } else { t.text_dim });
         let mut edited_hidden = hidden.clone();
         let editor_width = (ui.ctx().content_rect().width() - 10.0).clamp(1.0, 225.0);
@@ -1239,6 +1240,15 @@ fn transport_is_lit(command: &str, proxies_enabled: bool, loop_enabled: bool) ->
 fn transport_button(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, prefix: &str, icon: Icon, command: &str, label: &str) -> bool {
     let t = app.tokens;
     let response = ui.interact(rect, egui::Id::unique((prefix, command)), Sense::click()).on_hover_text(label);
+    let selected = match command {
+        "media.toggleProxies" => Some(app.session.media.use_proxies()),
+        "playback.loop" => Some(transport_loop_on(app, prefix == "source")),
+        "playback.toggle" => Some(app.playback.playing),
+        "source.playback.toggle" => Some(app.source_playback.clock.playing),
+        _ => None,
+    };
+    let accessible_label = format!("{}: {label}", if prefix == "source" { tl!("Source") } else { tl!("Program") });
+    crate::widgets::button_accessibility(&response, &accessible_label, selected);
     app.auto.add_response(&format!("{prefix}.transport.{command}"), &response, label);
     if response.hovered() {
         ui.painter().rect_filled(rect, 4.0, t.hover);

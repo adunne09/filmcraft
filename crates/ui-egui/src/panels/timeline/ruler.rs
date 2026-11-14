@@ -68,7 +68,8 @@ pub(super) fn draw_top(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, se
     for (icon, key, on, toggle, tip) in toggles {
         let r = Rect::from_min_size(pos2(x, y), vec2(28.0, 28.0));
         let resp = ui.interact(r, egui::Id::unique(("tl-toggle", key)), Sense::click()).on_hover_text(tip);
-        app.auto.add(&format!("timeline.toggle.{key}"), r, tip);
+        crate::widgets::button_accessibility(&resp, tip, toggle.then_some(on));
+        app.auto.add_response(&format!("timeline.toggle.{key}"), &resp, tip);
         if toggle && on {
             p.rect_filled(r, 4.0, t.pressed);
         } else if resp.hovered() {

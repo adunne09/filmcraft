@@ -47,6 +47,30 @@ pub fn accessible_name(response: Response, name: impl Into<String>) -> Response 
     response
 }
 
+/// Semantics for a painted action or toggle. The caller supplies the actual state, not its tint.
+/// Register on the real response so accessibility uses the same enabled state and hit bounds.
+pub fn button_accessibility(response: &Response, label: &str, selected: Option<bool>) {
+    // A fully clipped control has no usable target. Exporting Rect::NOTHING as a named
+    // native control gives macOS infinite bounds, which accessibility clients cannot decode.
+    if !response.rect.is_positive() || !response.rect.is_finite() {
+        response.ctx.accesskit_node_builder(response.id, |node| {
+            node.set_hidden();
+            node.clear_bounds();
+        });
+        return;
+    }
+    response.widget_info(|| match selected {
+        Some(on) => egui::WidgetInfo::selected(egui::Role::Button, response.enabled(), on, label),
+        None => egui::WidgetInfo::labeled(egui::Role::Button, response.enabled(), label),
+    });
+}
+
+/// An empty intersection must not become an inverted, off-screen accessibility rectangle.
+pub(crate) fn clipped_hit_rect(rect: Rect, clip: Rect) -> Rect {
+    let visible = rect.intersect(clip);
+    if visible.is_positive() { visible } else { Rect::NOTHING }
+}
+
 /// Numeric formatting and theme context for a [`hot_number`] field.
 ///
 /// Grouping the related knobs keeps the widget's call sites readable and below the argument-count
@@ -458,6 +482,10 @@ pub fn letter_toggle_clipped(ui: &mut Ui, rect: Rect, clip: Rect, letter: &str, 
 /// A flat icon toggle inside a rect.
 pub fn icon_toggle(ui: &mut Ui, rect: Rect, icon: Icon, on: bool, t: &Tokens, id: egui::Id, on_color: Option<Color32>) -> Response {
     let resp = ui.interact(rect, id, Sense::click());
+    // Fully clipped buttons use Rect::NOTHING; never pass its infinite coordinates to the painter.
+    if !rect.is_positive() {
+        return resp;
+    }
     if resp.hovered() {
         ui.painter().rect_filled(rect, 2.0, t.hover);
     }

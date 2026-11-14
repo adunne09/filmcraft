@@ -226,3 +226,18 @@ than one clip is selected, matching the existing Speed control.
 
 `clip_dialogs_ui::duration_text_edits_speed_and_rejects_invalid_input` exercises real
 text input, validation, application, Cancel, and Undo/Redo.
+
+## Custom-control accessibility
+
+Painted header actions, mode tabs, monitor transports, timeline toolbar buttons,
+track switches and Project footer actions expose semantic AccessKit metadata without
+hover. Track names include their lane (`Lock V1`, `Mute A1`); monitor transport names
+include Source or Program. Toggle state comes from the editor state, not icon tint.
+Mode tabs expose selection, and disabled Project actions expose their disabled state.
+Clipped track buttons expose their visible OS accessibility hit bounds. Fully clipped
+buttons are hidden and have no exported bounds, so native clients never receive infinities.
+
+`tests/it/accessibility_ui.rs` inspects names, roles, state and geometry without pointer
+input, and checks that inspection does not edit the project or move its playhead.
+These controls use the shared `widgets::button_accessibility` helper; automation-only
+rectangles are not treated as OS accessibility widgets.
